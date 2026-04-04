@@ -1,0 +1,81 @@
+{
+  "roles": [
+    {
+      "RoleId": "AROAEXAMPLE001",
+      "RoleName": "ReadOnly-Billing",
+      "Arn": "arn:aws:iam::123456789012:role/ReadOnly-Billing",
+      "Path": "/",
+      "Tags": [
+        {"Key": "Team", "Value": "FinOps"},
+        {"Key": "Purpose", "Value": "cost-reporting"},
+        {"Key": "Environment", "Value": "production"}
+      ],
+      "InlinePolicies": [
+        {
+          "PolicyName": "BillingAccess",
+          "Document": {
+            "Version": "2012-10-17",
+            "Statement": [
+              {
+                "Sid": "BillingRead",
+                "Effect": "Allow",
+                "Action": [
+                  "ce:GetCostAndUsage",
+                  "ce:GetReservationUtilization",
+                  "budgets:ViewBudget",
+                  "ec2:TerminateInstances",
+                  "ec2:StopInstances"
+                ],
+                "Resource": "*"
+              }
+            ]
+          }
+        }
+      ],
+      "ManagedPolicies": []
+    },
+    {
+      "RoleId": "AROAEXAMPLE002",
+      "RoleName": "Lambda-DataProcessor",
+      "Arn": "arn:aws:iam::123456789012:role/Lambda-DataProcessor",
+      "Path": "/",
+      "Tags": [
+        {"Key": "Team", "Value": "DataEng"},
+        {"Key": "Environment", "Value": "production"}
+      ],
+      "InlinePolicies": [],
+      "ManagedPolicies": [
+        {
+          "PolicyName": "AdministratorAccess",
+          "PolicyArn": "arn:aws:iam::aws:policy/AdministratorAccess"
+        }
+      ]
+    },
+    {
+      "RoleId": "AROAEXAMPLE003",
+      "RoleName": "S3-DataLake-Reader",
+      "Arn": "arn:aws:iam::123456789012:role/S3-DataLake-Reader",
+      "Path": "/",
+      "Tags": [
+        {"Key": "Purpose", "Value": "analytics"},
+        {"Key": "Environment", "Value": "staging"}
+      ],
+      "InlinePolicies": [
+        {
+          "PolicyName": "DataLakeAccess",
+          "Document": {
+            "Version": "2012-10-17",
+            "Statement": [
+              {
+                "Effect": "Allow",
+                "Action": "s3:*",
+                "Resource": "*"
+              }
+            ]
+          }
+        }
+      ],
+      "ManagedPolicies": []
+    }
+  ]
+}
