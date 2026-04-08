@@ -11,13 +11,39 @@ from ..schemas.finding import (
     Finding, FindingType, Severity, Remediation, PolicyBundle
 )
 
-# Actions that are unambiguously dangerous regardless of resource scope
+# Actions that are unambiguously dangerous regardless of resource scope.
+# sts:AssumeRole is intentionally excluded — it is checked separately
+# via _check_unconstrained_assume_role which evaluates Resource and Condition.
 CRITICAL_ACTIONS: frozenset[str] = frozenset({
-    "iam:CreateUser", "iam:AttachUserPolicy", "iam:AttachRolePolicy",
-    "iam:PutUserPolicy", "iam:PutRolePolicy", "iam:PassRole",
-    "iam:CreatePolicyVersion", "sts:AssumeRole",
-    "ec2:TerminateInstances", "s3:DeleteBucket",
-    "organizations:DeleteOrganization", "kms:ScheduleKeyDeletion",
+    # IAM privilege escalation
+    "iam:CreateUser",
+    "iam:CreateAccessKey",
+    "iam:AttachUserPolicy",
+    "iam:AttachRolePolicy",
+    "iam:PutUserPolicy",
+    "iam:PutRolePolicy",
+    "iam:PassRole",
+    "iam:CreatePolicyVersion",
+    "iam:SetDefaultPolicyVersion",
+    "iam:DeleteRolePolicy",
+    # Remote code execution
+    "ssm:SendCommand",
+    "lambda:InvokeFunction",
+    "ec2:RunInstances",
+    # Defense evasion
+    "cloudtrail:DeleteTrail",
+    "logs:DeleteLogGroup",
+    # Destruction
+    "ec2:TerminateInstances",
+    "s3:DeleteBucket",
+    "rds:DeleteDBInstance",
+    "secretsmanager:DeleteSecret",
+    "route53:DeleteHostedZone",
+    "elasticloadbalancing:DeleteLoadBalancer",
+    "kms:ScheduleKeyDeletion",
+    "organizations:DeleteOrganization",
+    # Exfiltration
+    "s3:PutBucketPolicy",
 })
 
 ADMIN_POLICY_ARNS: frozenset[str] = frozenset({
@@ -43,6 +69,7 @@ class HeuristicsFilter:
             yield from self._check_wildcard_resource(stmt, bundle)
             yield from self._check_not_action(stmt, bundle)
             yield from self._check_dangerous_actions(stmt, bundle)
+            yield from self._check_unconstrained_assume_role(stmt, bundle)
 
         yield from self._check_admin_managed_policies(bundle)
 
@@ -199,6 +226,45 @@ class HeuristicsFilter:
                     confidence=0.85,
                     tier=1,
                 )
+
+    def _check_unconstrained_assume_role(
+        self, stmt: dict, bundle: PolicyBundle
+    ) -> Iterator[Finding]:
+        """
+        Flag sts:AssumeRole only when it targets all resources ('*')
+        with no Condition block. Scoped AssumeRole (specific ARNs or
+        org conditions) is normal and should not be flagged.
+        """
+        actions = self._actions_as_list(stmt)
+        resources = self._resources_as_list(stmt)
+        has_condition = bool(stmt.get("Condition"))
+
+        if "sts:AssumeRole" in actions and "*" in resources and not has_condition:
+            yield Finding(
+                severity=Severity.HIGH,
+                finding_type=FindingType.DANGEROUS_ACTION,
+                title="Unconstrained sts:AssumeRole on all resources with no Condition",
+                description=(
+                    f"Principal '{bundle.resource.name}' can assume any role "
+                    f"in the account with no resource or condition constraints. "
+                    f"This is a lateral movement and privilege escalation risk."
+                ),
+                resource=bundle.resource,
+                offending_statement=stmt,
+                remediation=Remediation(
+                    recommendation=(
+                        "Replace Resource: '*' with explicit role ARNs. "
+                        "Add a Condition block using aws:PrincipalOrgID or "
+                        "sts:ExternalId to restrict the trust scope."
+                    ),
+                    reference_url=(
+                        "https://docs.aws.amazon.com/IAM/latest/UserGuide/"
+                        "id_roles_use_permissions-to-switch.html"
+                    ),
+                ),
+                confidence=0.90,
+                tier=1,
+            )
 
     def _check_admin_managed_policies(
         self, bundle: PolicyBundle
