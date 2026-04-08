@@ -3,6 +3,13 @@ Context Engine — Tier-2 Semantic Intent Extraction.
 
 Parses role/user names and resource tags to derive a human-readable
 'Semantic Intent' string used to prime the Inference Bridge.
+
+Matching strategy:
+  - Primary:   role/user name tokens only
+  - Secondary: trusted tag keys only (name, role, function)
+  - Excluded:  free-text tag values (description, purpose, team, environment)
+               to prevent incidental words like 'pipeline' in a description
+               from corrupting the primary intent classification.
 """
 from __future__ import annotations
 import re
@@ -34,9 +41,14 @@ _INTENT_MAP: dict[str, str] = {
     r"backup|snapshot|dr[_\-]?": (
         "create and restore snapshots/backups, no production workload mutation"
     ),
-    # Admin
-    r"admin|administrator|superuser|root|sre|platform[_\-]?eng": (
+    # Admin — sre intentionally excluded, handled by dedicated pattern below
+    r"admin|administrator|superuser|root|platform[_\-]?eng": (
         "broad administrative access — verify intentional"
+    ),
+    # SRE — operational, not admin
+    r"sre|site[_\-]?reliability": (
+        "operational access: infrastructure monitoring, incident response, "
+        "no IAM or org-level permissions expected"
     ),
     # Lambda/Serverless
     r"lambda[_\-]?exec|function[_\-]?exec|serverless": (
@@ -47,6 +59,12 @@ _INTENT_MAP: dict[str, str] = {
         "cross-account trust role; verify trust policy scope"
     ),
 }
+
+# Tag keys whose values are safe to match patterns against.
+# Free-text keys like 'description', 'purpose', 'team', 'environment'
+# are excluded because they frequently contain incidental words
+# (e.g. "siem log ingestion pipeline") that corrupt intent classification.
+_TRUSTED_TAG_KEYS: frozenset[str] = frozenset({"name", "role", "function"})
 
 
 @dataclass
@@ -60,47 +78,59 @@ class SemanticIntent:
 
 class ContextEngine:
     """
-    Derives intent from names, tags, and description fields.
+    Derives intent from names and a curated subset of tag keys.
     Returns a SemanticIntent that the SemanticAuditor injects into
     each AI AuditRequest.
     """
 
     def extract(self, name: str, tags: dict[str, str]) -> SemanticIntent:
-        search_corpus = self._build_corpus(name, tags)
-        matched_intents: list[tuple[str, str]] = []
-
+        # Primary match: role/user name only
+        name_matches: list[tuple[str, str]] = []
         for pattern, description in _INTENT_MAP.items():
-            if re.search(pattern, search_corpus, re.IGNORECASE):
-                keyword = re.search(pattern, search_corpus, re.IGNORECASE).group(0)
-                matched_intents.append((keyword, description))
+            m = re.search(pattern, name, re.IGNORECASE)
+            if m:
+                name_matches.append((m.group(0), description))
 
-        if not matched_intents:
+        # Secondary match: trusted tag keys only, not free-text values
+        trusted_tag_corpus = " ".join(
+            v for k, v in tags.items()
+            if k.lower() in _TRUSTED_TAG_KEYS
+        )
+        tag_matches: list[tuple[str, str]] = []
+        if trusted_tag_corpus:
+            seen_descriptions = {d for _, d in name_matches}
+            for pattern, description in _INTENT_MAP.items():
+                if description in seen_descriptions:
+                    continue
+                m = re.search(pattern, trusted_tag_corpus, re.IGNORECASE)
+                if m:
+                    tag_matches.append((m.group(0), description))
+
+        all_matches = name_matches + tag_matches
+
+        if not all_matches:
             return SemanticIntent(
                 raw_name=name,
                 tags=tags,
                 intent_description=(
                     f"No clear semantic pattern detected in '{name}'. "
-                    f"Treat as general-purpose and audit all permissions."
+                    f"Audit all permissions conservatively. "
+                    f"Pay attention to any destructive, IAM, or cross-account actions."
                 ),
                 confidence=0.2,
             )
 
-        # Merge multiple matches into a composite intent
-        keywords = [m[0] for m in matched_intents]
-        descriptions = "; ".join(dict.fromkeys(m[1] for m in matched_intents))
+        keywords = [m[0] for m in all_matches]
+        descriptions = "; ".join(dict.fromkeys(m[1] for m in all_matches))
+
+        # Name matches carry higher base confidence than tag-only matches
+        base = 0.6 if name_matches else 0.4
+        confidence = min(base + 0.1 * len(all_matches), 0.95)
 
         return SemanticIntent(
             raw_name=name,
             tags=tags,
             intent_description=descriptions,
             keywords_matched=keywords,
-            confidence=min(0.4 + 0.2 * len(matched_intents), 0.95),
+            confidence=confidence,
         )
-
-    def _build_corpus(self, name: str, tags: dict[str, str]) -> str:
-        tag_values = " ".join(
-            f"{k} {v}"
-            for k, v in tags.items()
-            if k.lower() in {"name", "role", "purpose", "team", "environment", "description"}
-        )
-        return f"{name} {tag_values}"
