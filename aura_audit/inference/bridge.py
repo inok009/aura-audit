@@ -79,7 +79,7 @@ class InferenceBridge:
     Async, non-blocking wrapper around the Ollama /api/generate endpoint.
 
     Usage:
-        bridge = InferenceBridge(model="qwen2.5:1.5b", concurrency=4)
+        bridge = InferenceBridge(model="qwen2.5:1.5b", concurrency=1)
         async with bridge:
             result = await bridge.audit(request)
     """
@@ -88,7 +88,7 @@ class InferenceBridge:
         self,
         model: str = "qwen2.5:1.5b",
         ollama_url: str = "http://localhost:11434",
-        concurrency: int = 4,
+        concurrency: int = 1,
         timeout_seconds: int = 120,
     ) -> None:
         self.model = model
@@ -180,7 +180,7 @@ class InferenceBridge:
     # ------------------------------------------------------------------ #
 
     def _build_prompt(self, request: AuditRequest) -> str:
-        perms_block = "\n".join(f"  - {p}" for p in request.effective_permissions[:60])
+        perms_block = "\n".join(f"  - {p}" for p in request.effective_permissions[:15])
         ct_block = (
             "\n".join(f"  - {c}" for c in request.cloudtrail_top_calls)
             if request.cloudtrail_top_calls
@@ -197,7 +197,7 @@ class InferenceBridge:
             f"SEMANTIC INTENT (inferred from name/tags):\n"
             f"  {request.semantic_intent}\n"
             f"  Intent confidence: {request.context_confidence:.0%}\n\n"
-            f"EFFECTIVE PERMISSIONS (sample, up to 60):\n{perms_block}\n\n"
+            f"EFFECTIVE PERMISSIONS (sample, up to 15):\n{perms_block}\n\n"
             f"CLOUDTRAIL — TOP API CALLS (last 30 days):\n{ct_block}\n\n"
             f"PRE-FLAGGED DANGEROUS ACTIONS (from static analysis):\n{dangerous_block}\n\n"
             f"Identify functional over-privilege. Respond with the JSON schema only."
@@ -210,9 +210,10 @@ class InferenceBridge:
             "system": _SYSTEM_PROMPT,
             "stream": False,
             "options": {
-                "temperature": 0.1,       # near-deterministic for security audits
+                "temperature": 0.1,
                 "top_p": 0.9,
-                "num_predict": 1024,
+                "num_predict": 400,
+                "num_ctx": 1024,
             },
         }
 
@@ -228,9 +229,9 @@ class InferenceBridge:
         """
         Robustly parse the SLM JSON output.
         Strips any accidental markdown fences before parsing.
+        Attempts recovery on truncated JSON before discarding.
         """
         cleaned = raw.strip()
-        # Strip ```json ... ``` fences if the model misbehaves
         if cleaned.startswith("```"):
             cleaned = "\n".join(
                 line for line in cleaned.splitlines()
@@ -239,23 +240,27 @@ class InferenceBridge:
 
         try:
             data = json.loads(cleaned)
-        except json.JSONDecodeError as exc:
-            logger.warning(
-                "Failed to parse SLM JSON for '%s': %s\nRaw: %.200s",
-                principal_name,
-                exc,
-                raw,
-            )
-            return InferenceResult(
-                principal_name=principal_name,
-                has_overprivilege=False,
-                severity="INFORMATIONAL",
-                findings=[],
-                reasoning_summary="",
-                confidence=0.0,
-                raw_response=raw,
-                inference_error=f"JSON_PARSE_ERROR: {exc}",
-            )
+        except json.JSONDecodeError:
+            recovered = self._attempt_json_recovery(cleaned)
+            if recovered:
+                logger.debug("Recovered truncated JSON for '%s'", principal_name)
+                data = recovered
+            else:
+                logger.debug(
+                    "Raw model output for '%s' (first 500 chars): %.500s",
+                    principal_name,
+                    raw,
+                )
+                return InferenceResult(
+                    principal_name=principal_name,
+                    has_overprivilege=False,
+                    severity="INFORMATIONAL",
+                    findings=[],
+                    reasoning_summary="",
+                    confidence=0.0,
+                    raw_response=raw,
+                    inference_error="JSON_PARSE_ERROR: truncated response",
+                )
 
         return InferenceResult(
             principal_name=principal_name,
@@ -266,3 +271,13 @@ class InferenceBridge:
             confidence=float(data.get("confidence", 0.5)),
             raw_response=raw,
         )
+
+    def _attempt_json_recovery(self, text: str) -> dict | None:
+        """Try to recover a truncated JSON object by trimming to the last valid closing brace."""
+        for i in range(len(text), 0, -1):
+            if text[i - 1] == "}":
+                try:
+                    return json.loads(text[:i])
+                except json.JSONDecodeError:
+                    continue
+        return None
