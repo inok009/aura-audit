@@ -11,26 +11,35 @@ import boto3
 from botocore.exceptions import ClientError, NoCredentialsError, ProfileNotFound
 
 from ..base import CloudProvider
-from ...schemas.finding import PolicyBundle
+from ...schemas.finding import PolicyBundle, Resource
 from .ingestion import AWSIngestion
 
 logger = logging.getLogger("aura_audit.aws_provider")
 
 
 class AWSProvider(CloudProvider):
-    def __init__(self, profile: str | None = None, region: str = "us-east-1") -> None:
+    def __init__(
+        self,
+        profile: str | None = None,
+        region: str = "us-east-1",
+        endpoint_url: str | None = None,
+    ) -> None:
         try:
             self._session = boto3.Session(
                 profile_name=profile,
                 region_name=region,
             )
             self._region = region
-            self._ingestion = AWSIngestion(self._session, region)
+            self._endpoint_url = endpoint_url
+            self._ingestion = AWSIngestion(
+                self._session, region, endpoint_url=endpoint_url
+            )
         except ProfileNotFound as exc:
             raise RuntimeError(f"AWS profile not found: {exc}") from exc
 
     async def get_caller_identity(self) -> dict[str, str]:
-        sts = self._session.client("sts")
+        kw = {"endpoint_url": self._endpoint_url} if self._endpoint_url else {}
+        sts = self._session.client("sts", **kw)
         return await asyncio.to_thread(sts.get_caller_identity)
 
     async def list_principals(
@@ -78,15 +87,25 @@ class AWSProvider(CloudProvider):
         self, principal: dict[str, Any]
     ) -> PolicyBundle:
         ptype = principal["type"]
-        meta = principal["_meta"]
+        meta = principal.get("_meta")
 
-        if ptype == "role":
+        # --principal-arn path: meta is None, build a minimal bundle
+        if meta is None:
+            bundle = PolicyBundle(
+                principal_id=principal["id"],
+                principal_type=ptype.capitalize(),
+                resource=Resource(
+                    type=f"AwsIam{ptype.capitalize()}",
+                    id=principal["arn"],
+                    name=principal["name"],
+                ),
+            )
+        elif ptype == "role":
             bundle = await self._ingestion.fetch_role_bundle(meta)
         elif ptype == "user":
             bundle = await self._ingestion.fetch_user_bundle(meta)
         else:
             # Groups: return an empty bundle for now (future work)
-            from ...schemas.finding import Resource
             bundle = PolicyBundle(
                 principal_id=principal["id"],
                 principal_type="Group",
@@ -129,6 +148,6 @@ class AWSProvider(CloudProvider):
             "type": ptype,
             "arn": arn,
             "name": name,
-            "id": arn,         # will be resolved during ingestion
-            "_meta": None,     # provider will handle None meta gracefully
+            "id": arn,
+            "_meta": None,
         }

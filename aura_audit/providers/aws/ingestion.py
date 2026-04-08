@@ -21,11 +21,18 @@ logger = logging.getLogger("aura_audit.ingestion")
 
 
 class AWSIngestion:
-    def __init__(self, session: boto3.Session, region: str) -> None:
+    def __init__(
+        self,
+        session: boto3.Session,
+        region: str,
+        endpoint_url: str | None = None,
+    ) -> None:
         self._session = session
         self._region = region
-        self._iam = session.client("iam")
-        self._cloudtrail = session.client("cloudtrail", region_name=region)
+        # Conditionally pass endpoint_url for LocalStack / custom endpoints
+        kw = {"endpoint_url": endpoint_url} if endpoint_url else {}
+        self._iam = session.client("iam", **kw)
+        self._cloudtrail = session.client("cloudtrail", region_name=region, **kw)
 
     # ── Principals ────────────────────────────────────────────────────
 
@@ -172,9 +179,14 @@ class AWSIngestion:
     # ── Internal helpers ──────────────────────────────────────────────
 
     def _get_role_tags(self, role_name: str) -> dict[str, str]:
+        """Paginated role tag fetch — single-page call misses tags beyond 100."""
         try:
-            resp = self._iam.list_role_tags(RoleName=role_name)
-            return {t["Key"]: t["Value"] for t in resp.get("Tags", [])}
+            tags = {}
+            paginator = self._iam.get_paginator("list_role_tags")
+            for page in paginator.paginate(RoleName=role_name):
+                for t in page.get("Tags", []):
+                    tags[t["Key"]] = t["Value"]
+            return tags
         except ClientError:
             return {}
 
